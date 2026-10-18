@@ -1,9 +1,16 @@
 # lexis-rust-driver
 
-The Rust driver for [Lexis](https://github.com/jk89/lexis), a fork of ScyllaDB
+<table><tr>
+<td valign="middle" width="160"><img src="https://raw.githubusercontent.com/jk89/lexisdb/develop/lexis-icon.svg" width="160" height="196" alt="Lexis"></td>
+<td valign="middle">
+
+The Rust driver for [Lexis](https://github.com/jk89/lexisdb), a fork of ScyllaDB
 that replaces the Murmur3 partitioner with byte-ordered partitioning, built on
 tablets. In Lexis the token of a partition is an order-preserving encoding of
 its partition key.
+
+</td>
+</tr></table>
 
 With a Lexis cluster, the driver computes these tokens on the client, so each
 query is sent to the node and shard that own its partition, and it follows
