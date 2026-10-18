@@ -1394,7 +1394,7 @@ If you are using this API, you are probably doing something wrong."
 
             let replicas: Option<smallvec::SmallVec<[_; 8]>> =
                 if let (Some(table_spec), Some(token)) =
-                    (statement_info.table, statement_info.token)
+                    (statement_info.table, statement_info.token.clone())
                 {
                     Some(
                         config
@@ -1407,10 +1407,11 @@ If you are using this API, you are probably doing something wrong."
                     None
                 };
 
+            let span_token = statement_info.token.clone();
             let span_creator = move || {
                 let span = RequestSpan::new_prepared(
                     partition_key.as_ref().map(|pk| pk.iter()),
-                    token,
+                    span_token.clone(),
                     serialized_values_size,
                 );
                 if let Some(replicas) = replicas.as_ref() {

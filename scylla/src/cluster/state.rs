@@ -5,7 +5,7 @@ use crate::observability::metrics::Metrics;
 use crate::policies::host_filter::HostFilter;
 use crate::routing::locator::ReplicaLocator;
 use crate::routing::locator::tablets::{RawTablet, Tablet, TabletsInfo};
-use crate::routing::partitioner::{PartitionerName, calculate_token_for_partition_key};
+use crate::routing::partitioner::{PartitionerName, calculate_token_for_partition_key_typed};
 use crate::routing::{Shard, Token};
 use crate::utils::safe_format::IteratorSafeFormatExt;
 
@@ -283,7 +283,12 @@ impl ClusterState {
             .as_deref()
             .and_then(PartitionerName::from_str)
             .unwrap_or_default();
-        calculate_token_for_partition_key(&values, &partitioner)
+        let pk_types: Vec<_> = table
+            .pk_column_specs
+            .iter()
+            .map(|spec| spec.typ().clone())
+            .collect();
+        calculate_token_for_partition_key_typed(&values, &partitioner, &pk_types)
             .map_err(ClusterStateTokenError::TokenCalculation)
     }
 

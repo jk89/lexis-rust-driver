@@ -48,6 +48,7 @@ use crate::errors::{
     PeersMetadataError, RequestAttemptError, RequestError, TablesMetadataError, UdtMetadataError,
 };
 use crate::routing::Token;
+use crate::routing::partitioner::PartitionerName;
 
 type PerKeyspace<T> = HashMap<String, T>;
 type PerKeyspaceResult<T, E> = PerKeyspace<Result<T, E>>;
@@ -162,7 +163,15 @@ impl ControlConnection {
         keyspace_to_fetch: &[String],
         fetch_schema: bool,
     ) -> Result<Metadata, MetadataError> {
-        let peers_query = self.query_peers(connect_port);
+        // The cluster partitioner decides how token strings are parsed, and is
+        // the partitioner of every table that does not name its own.
+        let cluster_partitioner = self.query_cluster_partitioner().await;
+        let ordered_tokens = cluster_partitioner
+            .as_deref()
+            .and_then(PartitionerName::from_str)
+            == Some(PartitionerName::Ordered);
+
+        let peers_query = self.query_peers(connect_port, ordered_tokens);
         let keyspaces_query = self.query_keyspaces(keyspace_to_fetch, fetch_schema);
         let client_routes_query = async {
             let Some(subscriber) = self.client_routes_subscriber() else {
@@ -174,10 +183,27 @@ impl ControlConnection {
 
         let peers: Vec<Peer>;
         let client_routes: ClientRoutes;
-        let keyspaces: HashMap<String, Result<Keyspace, SingleKeyspaceMetadataError>>;
+        let mut keyspaces: HashMap<String, Result<Keyspace, SingleKeyspaceMetadataError>>;
 
         (peers, client_routes, keyspaces) =
             tokio::try_join!(peers_query, client_routes_query, keyspaces_query)?;
+
+        // ScyllaDB only records a table's partitioner when it differs from the
+        // cluster default; with OrderedPartitioner as the default, fill it in.
+        if ordered_tokens && let Some(cluster_partitioner) = cluster_partitioner.as_deref() {
+            for keyspace in keyspaces.values_mut().flatten() {
+                for table in keyspace.tables.values_mut() {
+                    table
+                        .partitioner
+                        .get_or_insert_with(|| cluster_partitioner.to_owned());
+                }
+                for view in keyspace.views.values_mut() {
+                    view.view_metadata
+                        .partitioner
+                        .get_or_insert_with(|| cluster_partitioner.to_owned());
+                }
+            }
+        }
 
         if let Some(client_routes_subscriber) = self.client_routes_subscriber() {
             client_routes_subscriber.replace_client_routes(client_routes);
@@ -225,7 +251,40 @@ impl NodeInfoSource {
 }
 
 impl ControlConnection {
-    async fn query_peers(&self, connect_port: u16) -> Result<Vec<Peer>, MetadataError> {
+    /// Reads the cluster's partitioner from system.local. Failures are not
+    /// fatal: the driver then assumes Murmur3Partitioner, as before.
+    async fn query_cluster_partitioner(&self) -> Option<String> {
+        let result: Result<Option<String>, MetadataFetchErrorKind> = async {
+            let pager = self
+                .query_iter(
+                    "SELECT partitioner FROM system.local WHERE key='local'",
+                    &(),
+                )
+                .await?;
+            let mut rows = pager.rows_stream::<(Option<String>,)>()?;
+            Ok(match rows.try_next().await? {
+                Some((partitioner,)) => partitioner,
+                None => None,
+            })
+        }
+        .await;
+        match result {
+            Ok(partitioner) => partitioner,
+            Err(err) => {
+                warn!(
+                    "Failed to read the cluster partitioner from system.local: {}",
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    async fn query_peers(
+        &self,
+        connect_port: u16,
+        ordered_tokens: bool,
+    ) -> Result<Vec<Peer>, MetadataError> {
         let peers_query_stream = self
             .query_iter(
                 "SELECT host_id, rpc_address, data_center, rack, tokens FROM system.peers",
@@ -270,7 +329,9 @@ impl ControlConnection {
 
         let translated_peers_futures = untranslated_rows.map(|row_result| async {
             match row_result {
-                Ok((source, row)) => Self::create_peer_from_row(source, row, local_address).await,
+                Ok((source, row)) => {
+                    Self::create_peer_from_row(source, row, local_address, ordered_tokens).await
+                }
                 Err(err) => {
                     warn!(
                         "system.peers or system.local has an invalid row, skipping it: {}",
@@ -293,6 +354,7 @@ impl ControlConnection {
         source: NodeInfoSource,
         row: NodeInfoRow,
         local_address: SocketAddr,
+        ordered_tokens: bool,
     ) -> Option<Peer> {
         let NodeInfoRow {
             host_id,
@@ -322,6 +384,39 @@ impl ControlConnection {
         let node_addr = NodeAddr::Translatable(untranslated_address);
 
         let tokens_str: Vec<String> = tokens.unwrap_or_default();
+
+        // Lexis' OrderedPartitioner prints tokens as hex bytes; other
+        // partitioners print 64-bit integers.
+        if ordered_tokens {
+            match tokens_str
+                .iter()
+                .map(|s| parse_hex_token(s))
+                .collect::<Option<Vec<Token>>>()
+            {
+                Some(tokens) => {
+                    return Some(Peer {
+                        host_id,
+                        address: node_addr,
+                        tokens,
+                        datacenter,
+                        rack,
+                    });
+                }
+                None => {
+                    warn!(
+                        "Couldn't parse tokens of {} as hex (OrderedPartitioner): {:?}; proceeding with a dummy token",
+                        host_id, tokens_str
+                    );
+                    return Some(Peer {
+                        host_id,
+                        address: node_addr,
+                        tokens: vec![Token::new(rand::rng().random::<i64>())],
+                        datacenter,
+                        rack,
+                    });
+                }
+            }
+        }
 
         // Parse string representation of tokens as integer values
         let tokens: Vec<Token> = match tokens_str
@@ -1610,6 +1705,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_hex_token() {
+        assert_eq!(
+            parse_hex_token("6100008000"),
+            Some(Token::from_ordered_bytes(bytes::Bytes::from_static(&[
+                0x61, 0x00, 0x00, 0x80, 0x00
+            ])))
+        );
+        assert_eq!(
+            parse_hex_token(""),
+            Some(Token::from_ordered_bytes(bytes::Bytes::new()))
+        );
+        assert_eq!(parse_hex_token("abc"), None);
+        assert_eq!(parse_hex_token("zz"), None);
+    }
+
+    #[test]
     fn test_cql_type_parsing() {
         setup_tracing();
         let test_cases = [
@@ -1789,4 +1900,16 @@ mod tests {
             assert_eq!(parsed, expected);
         }
     }
+}
+
+/// Parses an OrderedPartitioner token printed as hex bytes.
+fn parse_hex_token(s: &str) -> Option<Token> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(Token::from_ordered_bytes(bytes.into()))
 }

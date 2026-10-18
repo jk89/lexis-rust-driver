@@ -110,10 +110,10 @@ impl PrecomputedReplicas {
 
         let global_replicas_iter = replication_data.get_global_ring().iter().map(|(token, _)| {
             let cur_replicas: Replicas = replication_data
-                .simple_strategy_replicas(*token, max_global_repfactor)
+                .simple_strategy_replicas(token, max_global_repfactor)
                 .cloned()
                 .collect();
-            (*token, cur_replicas)
+            (token.clone(), cur_replicas)
         });
         let global_replicas = PrecomputedReplicasRing {
             replicas_for_token: TokenRing::new(global_replicas_iter),
@@ -135,10 +135,10 @@ impl PrecomputedReplicas {
             let produce_replica_ring_iter = |rf| {
                 let ring_iter = dc_rep_data.get_dc_ring().iter().map(|(token, _)| {
                     let cur_replicas: Replicas = replication_data
-                        .nts_replicas_in_datacenter(*token, dc_name, rf)
+                        .nts_replicas_in_datacenter(token, dc_name, rf)
                         .cloned()
                         .collect();
-                    (*token, cur_replicas)
+                    (token.clone(), cur_replicas)
                 });
 
                 TokenRing::new(ring_iter)
@@ -173,7 +173,7 @@ impl PrecomputedReplicas {
     /// precomputation stage), `None` is returned.
     pub(crate) fn get_precomputed_simple_strategy_replicas(
         &self,
-        token: Token,
+        token: &Token,
         replication_factor: usize,
     ) -> Option<&[Arc<Node>]> {
         if replication_factor > self.global_replicas.max_rep_factor {
@@ -194,7 +194,7 @@ impl PrecomputedReplicas {
     /// If a provided datacenter does not exist, `None` is returned.
     pub(crate) fn get_precomputed_network_strategy_replicas(
         &self,
-        token: Token,
+        token: &Token,
         dc_name: &str,
         dc_replication_factor: usize,
     ) -> Option<&[Arc<Node>]> {
@@ -257,7 +257,7 @@ mod tests {
 
         let check = |token, replication_factor, expected_node_ids| {
             let replicas = precomputed_replicas
-                .get_precomputed_simple_strategy_replicas(Token::new(token), replication_factor);
+                .get_precomputed_simple_strategy_replicas(&Token::new(token), replication_factor);
 
             let ids: Vec<u16> = replicas
                 .unwrap()
@@ -272,7 +272,7 @@ mod tests {
         check(160, 1, vec![F]);
         check(160, 2, vec![F, A]);
         assert_eq!(
-            precomputed_replicas.get_precomputed_simple_strategy_replicas(Token::new(160), 3),
+            precomputed_replicas.get_precomputed_simple_strategy_replicas(&Token::new(160), 3),
             None
         );
 
@@ -299,7 +299,7 @@ mod tests {
 
         let check = |token, dc, replication_factor, expected_node_ids| {
             let replicas = precomputed_replicas.get_precomputed_network_strategy_replicas(
-                Token::new(token),
+                &Token::new(token),
                 dc,
                 replication_factor,
             );
@@ -319,7 +319,7 @@ mod tests {
         check(160, "eu", 3, vec![A, C, G]);
         assert_eq!(
             precomputed_replicas.get_precomputed_network_strategy_replicas(
-                Token::new(160),
+                &Token::new(160),
                 "eu",
                 4
             ),
@@ -332,7 +332,7 @@ mod tests {
         check(160, "us", 3, vec![F, D, E]);
         assert_eq!(
             precomputed_replicas.get_precomputed_network_strategy_replicas(
-                Token::new(160),
+                &Token::new(160),
                 "us",
                 4
             ),

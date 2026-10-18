@@ -635,9 +635,12 @@ impl DefaultPolicy {
     ) -> ReplicaSet<'a> {
         let datacenter = replica_location.datacenter();
 
-        cluster
-            .replica_locator()
-            .replicas_for_token(ts.token, ts.strategy, datacenter, table_spec)
+        cluster.replica_locator().replicas_for_token(
+            ts.token.clone(),
+            ts.strategy,
+            datacenter,
+            table_spec,
+        )
     }
 
     /// Wraps the provided predicate, adding the requirement for rack to match.
@@ -1134,7 +1137,7 @@ struct TokenWithStrategy<'a> {
 
 impl<'a> TokenWithStrategy<'a> {
     fn new(query: &'a RoutingInfo, cluster: &'a ClusterState) -> Option<TokenWithStrategy<'a>> {
-        let token = query.token?;
+        let token = query.token.clone()?;
         let keyspace_name = query.table?.ks_name();
         let keyspace = cluster.get_keyspace(keyspace_name)?;
         let strategy = &keyspace.strategy;

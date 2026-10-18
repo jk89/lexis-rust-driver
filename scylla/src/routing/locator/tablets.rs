@@ -22,6 +22,8 @@ pub(crate) enum TabletParsingError {
     TypeCheck(#[from] TypeCheckError),
     #[error("Shard id for tablet is negative: {0}")]
     ShardNum(i32),
+    #[error("Invalid tagged token in Lexis tablet routing payload")]
+    InvalidLexisToken,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -57,10 +59,96 @@ static RAW_TABLETS_CQL_TYPE: LazyLock<ColumnType<'static>> = LazyLock::new(|| {
 
 const CUSTOM_PAYLOAD_TABLETS_V1_KEY: &str = "tablets-routing-v1";
 
+// Lexis: the tokens are tagged ordered tokens (a kind byte -- 0x00 before all
+// keys, 0x01 key, 0x02 after all keys -- followed by the key bytes).
+type RawLexisTabletPayload<'frame, 'metadata> = (
+    &'frame [u8],
+    &'frame [u8],
+    ListlikeIterator<'frame, 'metadata, (Uuid, i32)>,
+);
+
+static RAW_LEXIS_TABLETS_CQL_TYPE: LazyLock<ColumnType<'static>> = LazyLock::new(|| {
+    ColumnType::Tuple(vec![
+        ColumnType::Native(NativeType::Blob),
+        ColumnType::Native(NativeType::Blob),
+        ColumnType::Collection {
+            frozen: false,
+            typ: CollectionType::List(Box::new(ColumnType::Tuple(vec![
+                ColumnType::Native(NativeType::Uuid),
+                ColumnType::Native(NativeType::Int),
+            ]))),
+        },
+    ])
+});
+
+const CUSTOM_PAYLOAD_LEXIS_TABLETS_V1_KEY: &str = "lexis-tablets-routing-v1";
+
+/// Converts the tagged exclusive start of a Lexis tablet range to the first
+/// token of the tablet: the immediate successor of the start, which appends 0x00.
+fn lexis_first_token(tagged: &[u8]) -> Option<Token> {
+    match tagged.split_first()? {
+        (0x00, []) => Some(Token::from_ordered_bytes(Bytes::new())),
+        (0x01, key) => {
+            let mut b = key.to_vec();
+            b.push(0x00);
+            Some(Token::from_ordered_bytes(b.into()))
+        }
+        _ => None,
+    }
+}
+
+/// Converts the tagged inclusive end of a Lexis tablet range to its last token.
+fn lexis_last_token(tagged: &[u8]) -> Option<Token> {
+    match tagged.split_first()? {
+        (0x01, key) => Some(Token::from_ordered_bytes(Bytes::copy_from_slice(key))),
+        (0x02, []) => Some(Token::ORDERED_MAX),
+        _ => None,
+    }
+}
+
+fn parse_replicas(
+    replicas: ListlikeIterator<'_, '_, (Uuid, i32)>,
+) -> Result<Vec<(Uuid, Shard)>, TabletParsingError> {
+    replicas
+        .map(|res| {
+            res.map_err(TabletParsingError::from)
+                .and_then(|(uuid, shard_num)| match shard_num.try_into() {
+                    Ok(s) => Ok((uuid, s)),
+                    Err(_) => Err(TabletParsingError::ShardNum(shard_num)),
+                })
+        })
+        .collect()
+}
+
 impl RawTablet {
+    fn from_lexis_custom_payload(payload: &Bytes) -> Result<RawTablet, TabletParsingError> {
+        <RawLexisTabletPayload as DeserializeValue<'_, '_>>::type_check(
+            RAW_LEXIS_TABLETS_CQL_TYPE.deref(),
+        )?;
+        let (first_token, last_token, replicas): RawLexisTabletPayload =
+            <RawLexisTabletPayload as DeserializeValue<'_, '_>>::deserialize(
+                RAW_LEXIS_TABLETS_CQL_TYPE.deref(),
+                Some(FrameSlice::new(payload)),
+            )?;
+        let replicas = parse_replicas(replicas)?;
+        let (Some(first_token), Some(last_token)) =
+            (lexis_first_token(first_token), lexis_last_token(last_token))
+        else {
+            return Err(TabletParsingError::InvalidLexisToken);
+        };
+        Ok(RawTablet {
+            first_token,
+            last_token,
+            replicas: RawTabletReplicas { replicas },
+        })
+    }
+
     pub(crate) fn from_custom_payload(
         payload: &HashMap<String, Bytes>,
     ) -> Option<Result<RawTablet, TabletParsingError>> {
+        if let Some(payload) = payload.get(CUSTOM_PAYLOAD_LEXIS_TABLETS_V1_KEY) {
+            return Some(Self::from_lexis_custom_payload(payload));
+        }
         let payload = payload.get(CUSTOM_PAYLOAD_TABLETS_V1_KEY)?;
 
         if let Err(err) =
@@ -257,7 +345,7 @@ impl Tablet {
     }
 
     pub(crate) fn range(&self) -> (Token, Token) {
-        (self.first_token, self.last_token)
+        (self.first_token.clone(), self.last_token.clone())
     }
 
     // Returns `Ok(())` if after the operation Tablet replicas are fully resolved.
@@ -348,22 +436,22 @@ impl TableTablets {
         }
     }
 
-    fn tablet_for_token(&self, token: Token) -> Option<&Tablet> {
+    fn tablet_for_token(&self, token: &Token) -> Option<&Tablet> {
         let idx = self
             .tablet_list
-            .partition_point(|tablet| tablet.last_token < token);
+            .partition_point(|tablet| &tablet.last_token < token);
         let tablet = self.tablet_list.get(idx);
-        tablet.filter(|t| t.first_token <= token)
+        tablet.filter(|t| &t.first_token <= token)
     }
 
-    pub(crate) fn replicas_for_token(&self, token: Token) -> Option<&[(Arc<Node>, Shard)]> {
+    pub(crate) fn replicas_for_token(&self, token: &Token) -> Option<&[(Arc<Node>, Shard)]> {
         self.tablet_for_token(token)
             .map(|tablet| tablet.replicas.all.as_ref())
     }
 
     pub(crate) fn dc_replicas_for_token(
         &self,
-        token: Token,
+        token: &Token,
         dc: &str,
     ) -> Option<&[(Arc<Node>, Shard)]> {
         self.tablet_for_token(token).map(|tablet| {
@@ -613,7 +701,8 @@ mod tests {
     use crate::cluster::Node;
     use crate::routing::Token;
     use crate::routing::locator::tablets::{
-        CUSTOM_PAYLOAD_TABLETS_V1_KEY, RAW_TABLETS_CQL_TYPE, RawTablet, RawTabletReplicas,
+        CUSTOM_PAYLOAD_LEXIS_TABLETS_V1_KEY, CUSTOM_PAYLOAD_TABLETS_V1_KEY,
+        RAW_LEXIS_TABLETS_CQL_TYPE, RAW_TABLETS_CQL_TYPE, RawTablet, RawTabletReplicas,
         TabletParsingError,
     };
     use crate::test_utils::setup_tracing;
@@ -674,6 +763,66 @@ mod tests {
             RawTablet::from_custom_payload(&custom_payload),
             Some(Err(TabletParsingError::Deserialization(_)))
         );
+    }
+
+    fn lexis_payload(first: &[u8], last: &[u8]) -> HashMap<String, Bytes> {
+        let value = CqlValue::Tuple(vec![
+            Some(CqlValue::Blob(first.to_vec())),
+            Some(CqlValue::Blob(last.to_vec())),
+            Some(CqlValue::List(vec![CqlValue::Tuple(vec![
+                Some(CqlValue::Uuid(Uuid::from_u64_pair(1, 2))),
+                Some(CqlValue::Int(3)),
+            ])])),
+        ]);
+        let mut data = vec![];
+        SerializeValue::serialize(
+            &value,
+            &RAW_LEXIS_TABLETS_CQL_TYPE,
+            CellWriter::new(&mut data),
+        )
+        .unwrap();
+        let mut custom_payload = HashMap::new();
+        custom_payload.insert(
+            CUSTOM_PAYLOAD_LEXIS_TABLETS_V1_KEY.to_string(),
+            Bytes::copy_from_slice(&data[4..]),
+        );
+        custom_payload
+    }
+
+    #[test]
+    fn test_raw_lexis_tablet_deser() {
+        // (key 'ab' terminated, key 'b' terminated]: first token is the successor of the start.
+        let tablet = RawTablet::from_custom_payload(&lexis_payload(
+            &[0x01, b'a', b'b', 0x00, 0x00],
+            &[0x01, b'b', 0x00, 0x00],
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            tablet.first_token,
+            Token::from_ordered_bytes(Bytes::from_static(&[b'a', b'b', 0x00, 0x00, 0x00]))
+        );
+        assert_eq!(
+            tablet.last_token,
+            Token::from_ordered_bytes(Bytes::from_static(&[b'b', 0x00, 0x00]))
+        );
+        assert_eq!(
+            tablet.replicas.replicas,
+            vec![(Uuid::from_u64_pair(1, 2), 3)]
+        );
+
+        // The first tablet starts at the minimum token, the last ends at the maximum.
+        let tablet = RawTablet::from_custom_payload(&lexis_payload(&[0x00], &[0x02]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tablet.first_token, Token::from_ordered_bytes(Bytes::new()));
+        assert_eq!(tablet.last_token, Token::ORDERED_MAX);
+
+        // Garbage kind bytes are rejected.
+        assert!(matches!(
+            RawTablet::from_custom_payload(&lexis_payload(&[0x05], &[0x02])),
+            Some(Err(TabletParsingError::InvalidLexisToken))
+        ));
     }
 
     #[test]
@@ -828,7 +977,7 @@ mod tests {
     #[test]
     fn table_tablets_empty() {
         let tablets: TableTablets = TableTablets::new_for_test();
-        assert_eq!(tablets.tablet_for_token(Token::new(1)), None);
+        assert_eq!(tablets.tablet_for_token(&Token::new(1)), None);
     }
 
     fn verify_ranges(tablets: &TableTablets, ranges: &[(i64, i64)]) {
@@ -860,27 +1009,27 @@ mod tests {
         verify_ranges(&tablets, &[(-200, 1000)]);
 
         assert_eq!(
-            tablets.tablet_for_token(Token::new(-1)),
+            tablets.tablet_for_token(&Token::new(-1)),
             Some(&tablets.tablet_list[0])
         );
         assert_eq!(
-            tablets.tablet_for_token(Token::new(0)),
+            tablets.tablet_for_token(&Token::new(0)),
             Some(&tablets.tablet_list[0])
         );
         assert_eq!(
-            tablets.tablet_for_token(Token::new(1)),
+            tablets.tablet_for_token(&Token::new(1)),
             Some(&tablets.tablet_list[0])
         );
         assert_eq!(
-            tablets.tablet_for_token(Token::new(-200)),
+            tablets.tablet_for_token(&Token::new(-200)),
             Some(&tablets.tablet_list[0])
         );
-        assert_eq!(tablets.tablet_for_token(Token::new(-201)), None);
+        assert_eq!(tablets.tablet_for_token(&Token::new(-201)), None);
         assert_eq!(
-            tablets.tablet_for_token(Token::new(1000)),
+            tablets.tablet_for_token(&Token::new(1000)),
             Some(&tablets.tablet_list[0])
         );
-        assert_eq!(tablets.tablet_for_token(Token::new(1001)), None);
+        assert_eq!(tablets.tablet_for_token(&Token::new(1001)), None);
     }
 
     #[test]

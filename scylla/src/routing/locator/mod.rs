@@ -110,9 +110,9 @@ impl ReplicaLocator {
     ) -> ReplicaSet<'a> {
         if let Some(tablets) = self.tablets.tablets_for_table(table_spec) {
             let replicas: Option<&[(Arc<Node>, Shard)]> = if let Some(datacenter) = datacenter {
-                tablets.dc_replicas_for_token(token, datacenter)
+                tablets.dc_replicas_for_token(&token, datacenter)
             } else {
-                tablets.replicas_for_token(token)
+                tablets.replicas_for_token(&token)
             };
             ReplicaSet {
                 inner: ReplicaSetInner::PlainSharded(replicas.unwrap_or(
@@ -127,7 +127,7 @@ impl ReplicaLocator {
                 Strategy::SimpleStrategy { replication_factor } => {
                     if let Some(datacenter) = datacenter {
                         let replicas =
-                            self.get_simple_strategy_replicas(token, *replication_factor);
+                            self.get_simple_strategy_replicas(&token, *replication_factor);
 
                         return ReplicaSet {
                             inner: ReplicaSetInner::FilteredSimple {
@@ -139,7 +139,7 @@ impl ReplicaLocator {
                     } else {
                         return ReplicaSet {
                             inner: ReplicaSetInner::Plain(
-                                self.get_simple_strategy_replicas(token, *replication_factor),
+                                self.get_simple_strategy_replicas(&token, *replication_factor),
                             ),
                             token,
                         };
@@ -152,7 +152,7 @@ impl ReplicaLocator {
                         if let Some(repfactor) = datacenter_repfactors.get(dc) {
                             return ReplicaSet {
                                 inner: ReplicaSetInner::Plain(
-                                    self.get_network_strategy_replicas(token, dc, *repfactor),
+                                    self.get_network_strategy_replicas(&token, dc, *repfactor),
                                 ),
                                 token,
                             };
@@ -168,7 +168,7 @@ impl ReplicaLocator {
                             inner: ReplicaSetInner::ChainedNTS {
                                 datacenter_repfactors,
                                 locator: self,
-                                token,
+                                token: token.clone(),
                             },
                             token,
                         };
@@ -222,7 +222,7 @@ impl ReplicaLocator {
 
     fn get_simple_strategy_replicas(
         &self,
-        token: Token,
+        token: &Token,
         replication_factor: usize,
     ) -> ReplicasArray<'_> {
         if replication_factor == 0 {
@@ -244,7 +244,7 @@ impl ReplicaLocator {
 
     fn get_network_strategy_replicas<'a>(
         &'a self,
-        token: Token,
+        token: &Token,
         datacenter: &str,
         datacenter_replication_factor: usize,
     ) -> ReplicasArray<'a> {
@@ -271,7 +271,7 @@ impl ReplicaLocator {
     }
 }
 
-fn with_computed_shard(node: NodeRef, token: Token) -> (NodeRef, Shard) {
+fn with_computed_shard<'a>(node: NodeRef<'a>, token: &Token) -> (NodeRef<'a>, Shard) {
     let shard = node
         .sharder()
         .map(|sharder| sharder.shard_of(token))
@@ -386,7 +386,7 @@ impl<'a> ReplicaSet<'a> {
             match &self.inner {
                 ReplicaSetInner::Plain(replicas) => replicas
                     .get(index)
-                    .map(|node| with_computed_shard(node, self.token)),
+                    .map(|node| with_computed_shard(node, &self.token)),
                 ReplicaSetInner::PlainSharded(replicas) => {
                     replicas.get(index).map(|(node, shard)| (node, *shard))
                 }
@@ -397,7 +397,7 @@ impl<'a> ReplicaSet<'a> {
                     .iter()
                     .filter(|node| node.datacenter.as_deref() == Some(*datacenter))
                     .nth(index)
-                    .map(|node| with_computed_shard(node, self.token)),
+                    .map(|node| with_computed_shard(node, &self.token)),
                 ReplicaSetInner::ChainedNTS {
                     datacenter_repfactors,
                     locator,
@@ -416,9 +416,9 @@ impl<'a> ReplicaSet<'a> {
 
                         if nodes_to_skip < repfactor {
                             return locator
-                                .get_network_strategy_replicas(*token, datacenter, repfactor)
+                                .get_network_strategy_replicas(token, datacenter, repfactor)
                                 .get(nodes_to_skip)
-                                .map(|node| with_computed_shard(node, self.token));
+                                .map(|node| with_computed_shard(node, &self.token));
                         }
 
                         nodes_to_skip -= repfactor;
@@ -465,7 +465,7 @@ impl<'a> IntoIterator for ReplicaSet<'a> {
                     let repfactor = *datacenter_repfactors.get(datacenter.as_str()).unwrap_or(&0);
                     ReplicaSetIteratorInner::ChainedNTS {
                         replicas: locator
-                            .get_network_strategy_replicas(token, datacenter, repfactor),
+                            .get_network_strategy_replicas(&token, datacenter, repfactor),
                         replicas_idx: 0,
 
                         locator,
@@ -534,7 +534,7 @@ impl<'a> Iterator for ReplicaSetIterator<'a> {
             ReplicaSetIteratorInner::Plain { replicas, idx } => {
                 if let Some(replica) = replicas.get(*idx) {
                     *idx += 1;
-                    return Some(with_computed_shard(replica, self.token));
+                    return Some(with_computed_shard(replica, &self.token));
                 }
 
                 None
@@ -555,7 +555,7 @@ impl<'a> Iterator for ReplicaSetIterator<'a> {
                 while let Some(replica) = replicas.get(*idx) {
                     *idx += 1;
                     if replica.datacenter.as_deref() == Some(*datacenter) {
-                        return Some(with_computed_shard(replica, self.token));
+                        return Some(with_computed_shard(replica, &self.token));
                     }
                 }
 
@@ -571,15 +571,14 @@ impl<'a> Iterator for ReplicaSetIterator<'a> {
             } => {
                 if let Some(replica) = replicas.get(*replicas_idx) {
                     *replicas_idx += 1;
-                    Some(with_computed_shard(replica, self.token))
+                    Some(with_computed_shard(replica, &self.token))
                 } else if *datacenter_idx + 1 < locator.datacenters.len() {
                     *datacenter_idx += 1;
                     *replicas_idx = 0;
 
                     let datacenter = &locator.datacenters[*datacenter_idx];
                     let repfactor = *datacenter_repfactors.get(datacenter).unwrap_or(&0);
-                    *replicas =
-                        locator.get_network_strategy_replicas(*token, datacenter, repfactor);
+                    *replicas = locator.get_network_strategy_replicas(token, datacenter, repfactor);
 
                     self.next()
                 } else {
@@ -692,16 +691,15 @@ struct ReplicasOrderedNTSIterator<'a> {
     inner: ReplicasOrderedNTSIteratorInner<'a>,
 }
 
+// The token is held by ReplicasOrderedNTSIterator itself.
 enum ReplicasOrderedNTSIteratorInner<'a> {
     FreshForPick {
         datacenter_repfactors: &'a HashMap<String, usize>,
         locator: &'a ReplicaLocator,
-        token: Token,
     },
     Picked {
         datacenter_repfactors: &'a HashMap<String, usize>,
         locator: &'a ReplicaLocator,
-        token: Token,
         picked: NodeRef<'a>,
     },
     ComputedFallback {
@@ -718,10 +716,13 @@ impl<'a> Iterator for ReplicasOrderedNTSIterator<'a> {
             ReplicasOrderedNTSIteratorInner::FreshForPick {
                 datacenter_repfactors,
                 locator,
-                token,
             } => {
+                let token = &self.token;
                 // We're going to find the primary replica for the given token.
-                let nodes_on_ring = locator.replication_data.get_global_ring().ring_range(token);
+                let nodes_on_ring = locator
+                    .replication_data
+                    .get_global_ring()
+                    .ring_range(&token);
                 for node in nodes_on_ring {
                     // If this node's DC has some replicas in this NTS...
                     if let Some(dc) = &node.datacenter
@@ -731,10 +732,9 @@ impl<'a> Iterator for ReplicasOrderedNTSIterator<'a> {
                         self.inner = ReplicasOrderedNTSIteratorInner::Picked {
                             datacenter_repfactors,
                             locator,
-                            token,
                             picked: node,
                         };
-                        return Some(with_computed_shard(node, self.token));
+                        return Some(with_computed_shard(node, &self.token));
                     }
                 }
                 None
@@ -742,9 +742,9 @@ impl<'a> Iterator for ReplicasOrderedNTSIterator<'a> {
             ReplicasOrderedNTSIteratorInner::Picked {
                 datacenter_repfactors,
                 locator,
-                token,
                 picked,
             } => {
+                let token = &self.token;
                 // Clippy can't check that in Eq and Hash impls we don't actually use any field with interior mutability
                 // (in Node only `NodeConnectionPool` is such, holding an RwLock and an ArcSwap inside).
                 // https://rust-lang.github.io/rust-clippy/master/index.html#mutable_key_type
@@ -753,7 +753,7 @@ impl<'a> Iterator for ReplicasOrderedNTSIterator<'a> {
                 for (datacenter, repfactor) in datacenter_repfactors.iter() {
                     all_replicas.extend(
                         locator
-                            .get_network_strategy_replicas(token, datacenter, *repfactor)
+                            .get_network_strategy_replicas(&token, datacenter, *repfactor)
                             .iter(),
                     );
                 }
@@ -761,7 +761,10 @@ impl<'a> Iterator for ReplicasOrderedNTSIterator<'a> {
                 all_replicas.remove(picked);
 
                 let mut replicas_ordered = vec![];
-                let nodes_on_ring = locator.replication_data.get_global_ring().ring_range(token);
+                let nodes_on_ring = locator
+                    .replication_data
+                    .get_global_ring()
+                    .ring_range(&token);
                 for node in nodes_on_ring {
                     if all_replicas.is_empty() {
                         // All replicas were put in order.
@@ -788,7 +791,7 @@ impl<'a> Iterator for ReplicasOrderedNTSIterator<'a> {
             } => {
                 if let Some(replica) = replicas.get(*idx) {
                     *idx += 1;
-                    Some(with_computed_shard(replica, self.token))
+                    Some(with_computed_shard(replica, &self.token))
                 } else {
                     None
                 }
@@ -833,14 +836,13 @@ impl<'a> IntoIterator for ReplicasOrdered<'a> {
                 ReplicaSetInner::ChainedNTS {
                     datacenter_repfactors,
                     locator,
-                    token,
+                    token: _,
                 } => ReplicasOrderedIteratorInner::PolyDatacenterNTS {
                     replicas_ordered_iter: ReplicasOrderedNTSIterator {
                         token: replica_set.token,
                         inner: ReplicasOrderedNTSIteratorInner::FreshForPick {
                             datacenter_repfactors,
                             locator,
-                            token,
                         },
                     },
                 },

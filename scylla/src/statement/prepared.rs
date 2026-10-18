@@ -708,6 +708,10 @@ pub enum TokenCalculationError {
     /// Value was too long to be used in partition key.
     #[error("Value bytes too long to create partition key, max 65 535 allowed! value.len(): {0}")]
     ValueTooLong(usize),
+    /// OrderedPartitioner encodes each partition key column by its type, and
+    /// the types were not provided.
+    #[error("OrderedPartitioner needs the partition key column types to compute a token")]
+    MissingPartitionKeyTypes,
 }
 
 /// An error returned by [`PreparedStatement::compute_partition_key()`].
@@ -742,6 +746,9 @@ impl PartitionKeyError {
             PartitionKeyError::Serialization(err) => {
                 ExecutionError::BadQuery(BadQuery::SerializationError(err))
             }
+            PartitionKeyError::TokenCalculation(
+                TokenCalculationError::MissingPartitionKeyTypes,
+            ) => ExecutionError::BadQuery(BadQuery::PartitionKeyExtraction),
         }
     }
 }
@@ -827,6 +834,12 @@ impl<'ps> PartitionKey<'ps> {
         &self,
         partitioner_name: &PartitionerName,
     ) -> Result<Token, TokenCalculationError> {
+        if *partitioner_name == PartitionerName::Ordered {
+            let encoded = crate::routing::ordered_encoding::encode_partition_key(
+                self.iter().map(|(val, spec)| (spec.typ(), val)),
+            );
+            return Ok(Token::from_ordered_bytes(encoded.into()));
+        }
         let mut partitioner_hasher = partitioner_name.build_hasher();
         let mut writer = |chunk: &[u8]| partitioner_hasher.write(chunk);
 

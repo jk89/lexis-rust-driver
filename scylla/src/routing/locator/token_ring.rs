@@ -19,7 +19,7 @@ impl<ElemT> TokenRing<ElemT> {
 
     pub(crate) fn new(ring_iter: impl Iterator<Item = (Token, ElemT)>) -> TokenRing<ElemT> {
         let mut ring: Vec<(Token, ElemT)> = ring_iter.collect();
-        ring.sort_by_key(|a| a.0);
+        ring.sort_by(|a, b| a.0.cmp(&b.0));
         TokenRing { ring }
     }
 
@@ -32,8 +32,11 @@ impl<ElemT> TokenRing<ElemT> {
     /// The iterator traverses the whole ring in the direction of increasing tokens.
     /// After reaching the maximum token it wraps around and continues from the lowest one.
     /// The iterator visits each member once, it doesn't have infinite length.
-    pub fn ring_range_full(&self, token: Token) -> impl Iterator<Item = &(Token, ElemT)> {
-        let binary_search_index: usize = match self.ring.binary_search_by(|e| e.0.cmp(&token)) {
+    pub fn ring_range_full<'a>(
+        &'a self,
+        token: &Token,
+    ) -> impl Iterator<Item = &'a (Token, ElemT)> + use<'a, ElemT> {
+        let binary_search_index: usize = match self.ring.binary_search_by(|e| e.0.cmp(token)) {
             Ok(exact_match_index) => exact_match_index,
             Err(first_greater_index) => first_greater_index,
         };
@@ -49,12 +52,15 @@ impl<ElemT> TokenRing<ElemT> {
     /// After reaching the maximum token it wraps around and continues from the lowest one.
     /// The iterator visits each member once, it doesn't have an infinite length.
     /// To access the token along with the element you can use `ring_range_full`.
-    pub fn ring_range(&self, token: Token) -> impl Iterator<Item = &ElemT> {
+    pub fn ring_range<'a>(
+        &'a self,
+        token: &Token,
+    ) -> impl Iterator<Item = &'a ElemT> + use<'a, ElemT> {
         self.ring_range_full(token).map(|(_t, e)| e)
     }
 
     /// Traverses the ring starting at the given token and returns the first ring member encountered.
-    pub fn get_elem_for_token(&self, token: Token) -> Option<&ElemT> {
+    pub fn get_elem_for_token(&self, token: &Token) -> Option<&ElemT> {
         self.ring_range(token).next()
     }
 
@@ -90,105 +96,105 @@ mod tests {
         let ring: TokenRing<i32> = TokenRing::new(ring_data.into_iter());
 
         assert_eq!(
-            ring.ring_range(Token::new(-35))
+            ring.ring_range(&Token::new(-35))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-3, -2, -1, 0, 1, 2, 3]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(-30))
+            ring.ring_range(&Token::new(-30))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-3, -2, -1, 0, 1, 2, 3]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(-25))
+            ring.ring_range(&Token::new(-25))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-2, -1, 0, 1, 2, 3, -3]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(-20))
+            ring.ring_range(&Token::new(-20))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-2, -1, 0, 1, 2, 3, -3]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(-15))
+            ring.ring_range(&Token::new(-15))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-1, 0, 1, 2, 3, -3, -2]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(-10))
+            ring.ring_range(&Token::new(-10))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-1, 0, 1, 2, 3, -3, -2]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(-5))
+            ring.ring_range(&Token::new(-5))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![0, 1, 2, 3, -3, -2, -1]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(0))
+            ring.ring_range(&Token::new(0))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![0, 1, 2, 3, -3, -2, -1]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(5))
+            ring.ring_range(&Token::new(5))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![1, 2, 3, -3, -2, -1, 0]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(10))
+            ring.ring_range(&Token::new(10))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![1, 2, 3, -3, -2, -1, 0]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(15))
+            ring.ring_range(&Token::new(15))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![2, 3, -3, -2, -1, 0, 1]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(20))
+            ring.ring_range(&Token::new(20))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![2, 3, -3, -2, -1, 0, 1]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(25))
+            ring.ring_range(&Token::new(25))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![3, -3, -2, -1, 0, 1, 2]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(30))
+            ring.ring_range(&Token::new(30))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![3, -3, -2, -1, 0, 1, 2]
         );
 
         assert_eq!(
-            ring.ring_range(Token::new(35))
+            ring.ring_range(&Token::new(35))
                 .cloned()
                 .collect::<Vec<i32>>(),
             vec![-3, -2, -1, 0, 1, 2, 3]

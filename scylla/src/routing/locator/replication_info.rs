@@ -75,7 +75,7 @@ impl ReplicationInfo {
                 datacenter_nodes
                     .entry(datacenter_name)
                     .or_default()
-                    .push((*token, node.clone()));
+                    .push((token.clone(), node.clone()));
             }
         }
 
@@ -109,11 +109,11 @@ impl ReplicationInfo {
 
     /// Creates an iterator over SimpleStrategy replicas for the given token and replication factor.
     /// The iterator computes consecutive replicas lazily as needed.
-    pub(crate) fn simple_strategy_replicas(
-        &self,
-        token: Token,
+    pub(crate) fn simple_strategy_replicas<'a>(
+        &'a self,
+        token: &Token,
         replication_factor: usize,
-    ) -> impl Iterator<Item = &Arc<Node>> {
+    ) -> impl Iterator<Item = &'a Arc<Node>> + use<'a> {
         let num_to_take = cmp::min(replication_factor, self.unique_nodes_in_global_ring.len());
 
         self.global_ring
@@ -126,7 +126,7 @@ impl ReplicationInfo {
     /// The iterator computes consecutive replicas lazily as needed.
     pub(crate) fn nts_replicas_in_datacenter<'a>(
         &'a self,
-        token: Token,
+        token: &Token,
         datacenter_name: &str,
         replication_factor: usize,
     ) -> impl Iterator<Item = &'a Arc<Node>> + use<'a> {
@@ -222,7 +222,7 @@ mod tests {
 
         let check = |token, replication_factor, expected_node_ids| {
             let replicas =
-                replication_info.simple_strategy_replicas(Token::new(token), replication_factor);
+                replication_info.simple_strategy_replicas(&Token::new(token), replication_factor);
             let ids: Vec<u16> = replicas.map(|node| node.address.port()).collect();
 
             assert_eq!(ids, expected_node_ids);
@@ -256,7 +256,7 @@ mod tests {
         let replication_info = ReplicationInfo::new(ring);
 
         let check = |token, dc, rf, expected| {
-            let replicas = replication_info.nts_replicas_in_datacenter(Token::new(token), dc, rf);
+            let replicas = replication_info.nts_replicas_in_datacenter(&Token::new(token), dc, rf);
             let ids: Vec<u16> = replicas.map(|node| node.address.port()).collect();
 
             assert_eq!(ids, expected);

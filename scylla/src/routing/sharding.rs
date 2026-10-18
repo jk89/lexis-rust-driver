@@ -77,7 +77,7 @@ pub struct Sharder {
 impl std::str::FromStr for Token {
     type Err = std::num::ParseIntError;
     fn from_str(s: &str) -> Result<Token, std::num::ParseIntError> {
-        Ok(Token { value: s.parse()? })
+        Ok(Token::new(s.parse()?))
     }
 }
 
@@ -106,8 +106,10 @@ impl Sharder {
     }
 
     /// Assuming the node is a replica for a given token, returns the shard that owns this token.
-    pub fn shard_of(&self, token: Token) -> Shard {
-        let mut biased_token = (token.value as u64).wrapping_add(1u64 << 63);
+    pub fn shard_of(&self, token: &Token) -> Shard {
+        // For ordered tokens value() is ScyllaDB's 64-bit projection, so this
+        // matches the server's static sharding for both token kinds.
+        let mut biased_token = (token.value() as u64).wrapping_add(1u64 << 63);
         biased_token <<= self.msb_ignore;
         (((biased_token as u128) * (self.nr_shards.get() as u128)) >> 64) as Shard
     }
@@ -294,18 +296,8 @@ mod tests {
         setup_tracing();
         /* Test values taken from the gocql driver.  */
         let sharder = Sharder::new(ShardCount::new(4).unwrap(), 12);
-        assert_eq!(
-            sharder.shard_of(Token {
-                value: -9219783007514621794
-            }),
-            3
-        );
-        assert_eq!(
-            sharder.shard_of(Token {
-                value: 9222582454147032830
-            }),
-            3
-        );
+        assert_eq!(sharder.shard_of(&Token::new(-9219783007514621794)), 3);
+        assert_eq!(sharder.shard_of(&Token::new(9222582454147032830)), 3);
     }
 
     #[test]

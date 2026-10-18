@@ -197,7 +197,7 @@ pub(crate) fn create_ring(metadata: &Metadata) -> impl Iterator<Item = (Token, A
         ));
 
         for token in &peer.tokens {
-            ring.push((*token, node.clone()));
+            ring.push((token.clone(), node.clone()));
         }
     }
 

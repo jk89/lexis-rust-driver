@@ -9,6 +9,7 @@
 //!     - the partitioner employed when using CDC (_Change Data Capture_).
 
 use bytes::Buf;
+use scylla_cql::frame::response::result::ColumnType;
 use scylla_cql::frame::types::RawValue;
 use scylla_cql::serialize::row::SerializedValues;
 use std::num::Wrapping;
@@ -31,6 +32,11 @@ pub enum PartitionerName {
     // TODO(2.0): Rename variant to Cdc.
     #[expect(clippy::upper_case_acronyms)]
     CDC,
+
+    /// Lexis' OrderedPartitioner: the token is an order-preserving encoding
+    /// of the partition key. Computing it needs the partition key column
+    /// types (see [calculate_token_for_partition_key_typed]).
+    Ordered,
 }
 
 impl PartitionerName {
@@ -39,6 +45,14 @@ impl PartitionerName {
             Some(PartitionerName::Murmur3)
         } else if name.ends_with("CDCPartitioner") {
             Some(PartitionerName::CDC)
+        } else if matches!(
+            name,
+            "org.lexis.dht.LexisByteOrderedPartitioner"
+                | "LexisByteOrderedPartitioner"
+                | "org.lexis.dht.OrderedPartitioner"
+                | "OrderedPartitioner"
+        ) {
+            Some(PartitionerName::Ordered)
         } else {
             None
         }
@@ -55,6 +69,9 @@ impl Partitioner for PartitionerName {
                 PartitionerHasherAny::Murmur3(Murmur3Partitioner.build_hasher())
             }
             PartitionerName::CDC => PartitionerHasherAny::CDC(CDCPartitioner.build_hasher()),
+            PartitionerName::Ordered => {
+                PartitionerHasherAny::Ordered(OrderedPartitioner.build_hasher())
+            }
         }
     }
 }
@@ -73,6 +90,9 @@ pub enum PartitionerHasherAny {
     // TODO(2.0): Rename CDCPartitionerHasher to CdcPartitionerHasher
     #[expect(clippy::upper_case_acronyms)]
     CDC(CDCPartitionerHasher),
+
+    /// Hasher for [OrderedPartitioner].
+    Ordered(OrderedPartitionerHasher),
 }
 
 impl sealed::Sealed for PartitionerHasherAny {}
@@ -81,6 +101,7 @@ impl PartitionerHasher for PartitionerHasherAny {
         match self {
             PartitionerHasherAny::Murmur3(h) => h.write(pk_part),
             PartitionerHasherAny::CDC(h) => h.write(pk_part),
+            PartitionerHasherAny::Ordered(h) => h.write(pk_part),
         }
     }
 
@@ -88,6 +109,7 @@ impl PartitionerHasher for PartitionerHasherAny {
         match self {
             PartitionerHasherAny::Murmur3(h) => h.finish(),
             PartitionerHasherAny::CDC(h) => h.finish(),
+            PartitionerHasherAny::Ordered(h) => h.finish(),
         }
     }
 }
@@ -321,6 +343,37 @@ enum CDCPartitionerHasherState {
     Computed(Token),
 }
 
+/// Lexis' OrderedPartitioner. Its hasher takes the already-encoded key
+/// (see [crate::routing::ordered_encoding]) and returns it as the token.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct OrderedPartitioner;
+
+/// Hasher for [OrderedPartitioner]: concatenates the encoded key bytes.
+#[derive(Default)]
+pub struct OrderedPartitionerHasher {
+    buf: Vec<u8>,
+}
+
+impl sealed::Sealed for OrderedPartitioner {}
+impl Partitioner for OrderedPartitioner {
+    type Hasher = OrderedPartitionerHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        OrderedPartitionerHasher::default()
+    }
+}
+
+impl sealed::Sealed for OrderedPartitionerHasher {}
+impl PartitionerHasher for OrderedPartitionerHasher {
+    fn write(&mut self, pk_part: &[u8]) {
+        self.buf.extend_from_slice(pk_part);
+    }
+
+    fn finish(&self) -> Token {
+        Token::from_ordered_bytes(bytes::Bytes::copy_from_slice(&self.buf))
+    }
+}
+
 /// Partitioner used for Change Data Capture (CDC) in ScyllaDB.
 pub struct CDCPartitioner;
 
@@ -368,14 +421,14 @@ impl PartitionerHasher for CDCPartitionerHasher {
     }
 
     fn finish(&self) -> Token {
-        match self.state {
+        match &self.state {
             // Looking at ScyllaDB code it seems that here we actually want token with this value.
             // If the value is too short ScyllaDB returns `dht::minimum_token()`:
             // https://github.com/scylladb/scylladb/blob/4be70bfc2bc7f133cab492b4aac7bab9c790a48c/cdc/cdc_partitioner.cc#L32
             // When you call `long_token` on `minimum_token` it will actually return `i64::MIN`:
             // https://github.com/scylladb/scylladb/blob/0a7854ea4de04f20b71326ba5940b5fac6f7241a/dht/token.cc#L21-L35
             CDCPartitionerHasherState::Feeding { .. } => Token::INVALID,
-            CDCPartitionerHasherState::Computed(token) => token,
+            CDCPartitionerHasherState::Computed(token) => token.clone(),
         }
     }
 }
@@ -393,10 +446,33 @@ impl PartitionerHasher for CDCPartitionerHasher {
 ///
 /// NOTE: the provided values must completely constitute partition key
 /// and be in the order defined in CREATE TABLE statement.
+/// Like [calculate_token_for_partition_key], with the partition key column
+/// types, which OrderedPartitioner needs.
+pub(crate) fn calculate_token_for_partition_key_typed(
+    serialized_partition_key_values: &SerializedValues,
+    partitioner: &PartitionerName,
+    pk_types: &[ColumnType<'_>],
+) -> Result<Token, TokenCalculationError> {
+    if *partitioner == PartitionerName::Ordered {
+        let values: Vec<&[u8]> = serialized_partition_key_values
+            .iter()
+            .map(|rv| rv.as_value().unwrap_or(&[]))
+            .collect();
+        let encoded = crate::routing::ordered_encoding::encode_partition_key(
+            pk_types.iter().zip(values.iter().copied()),
+        );
+        return Ok(Token::from_ordered_bytes(encoded.into()));
+    }
+    calculate_token_for_partition_key(serialized_partition_key_values, partitioner)
+}
+
 pub(crate) fn calculate_token_for_partition_key(
     serialized_partition_key_values: &SerializedValues,
     partitioner: &PartitionerName,
 ) -> Result<Token, TokenCalculationError> {
+    if *partitioner == PartitionerName::Ordered {
+        return Err(TokenCalculationError::MissingPartitionKeyTypes);
+    }
     let mut partitioner_hasher = partitioner.build_hasher();
 
     if serialized_partition_key_values.element_count() == 1 {

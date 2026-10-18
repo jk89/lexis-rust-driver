@@ -1675,14 +1675,14 @@ impl Session {
                 .config
                 .serial_consistency
                 .unwrap_or(execution_profile.serial_consistency),
-            token,
+            token: token.clone(),
             table: table_spec,
             is_confirmed_lwt: prepared.is_confirmed_lwt(),
         };
 
         let span = RequestSpan::new_prepared(
             partition_key.as_ref().map(|pk| pk.iter()),
-            token,
+            token.clone(),
             serialized_values.buffer_size(),
         );
 
