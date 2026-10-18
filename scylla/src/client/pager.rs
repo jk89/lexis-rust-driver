@@ -1365,6 +1365,8 @@ If you are using this API, you are probably doing something wrong."
                     return proof;
                 }
             };
+            // Lexis: the routing plan routes prefix and range reads too.
+            let token = prepared_ref.lexis_routing_token(values_ref).or(token);
 
             let table_spec = config.prepared.get_table_spec();
             let statement_info = RoutingInfo {

@@ -288,8 +288,13 @@ impl ClusterState {
             .iter()
             .map(|spec| spec.typ().clone())
             .collect();
-        calculate_token_for_partition_key_typed(&values, &partitioner, &pk_types)
-            .map_err(ClusterStateTokenError::TokenCalculation)
+        calculate_token_for_partition_key_typed(
+            &values,
+            &partitioner,
+            &pk_types,
+            &table.pk_descending,
+        )
+        .map_err(ClusterStateTokenError::TokenCalculation)
     }
 
     /// Access to replicas owning a given token

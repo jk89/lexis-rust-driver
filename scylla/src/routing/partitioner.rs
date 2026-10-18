@@ -452,6 +452,7 @@ pub(crate) fn calculate_token_for_partition_key_typed(
     serialized_partition_key_values: &SerializedValues,
     partitioner: &PartitionerName,
     pk_types: &[ColumnType<'_>],
+    pk_descending: &[bool],
 ) -> Result<Token, TokenCalculationError> {
     if *partitioner == PartitionerName::Ordered {
         let values: Vec<&[u8]> = serialized_partition_key_values
@@ -460,6 +461,7 @@ pub(crate) fn calculate_token_for_partition_key_typed(
             .collect();
         let encoded = crate::routing::ordered_encoding::encode_partition_key(
             pk_types.iter().zip(values.iter().copied()),
+            pk_descending,
         );
         return Ok(Token::from_ordered_bytes(encoded.into()));
     }

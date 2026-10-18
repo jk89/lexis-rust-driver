@@ -15,6 +15,9 @@ pub const LWT_OPTIMIZATION_META_BIT_MASK_KEY: &str = "LWT_OPTIMIZATION_META_BIT_
 const TABLETS_ROUTING_V1_KEY: &str = "TABLETS_ROUTING_V1";
 /// Lexis' tablet routing: like TABLETS_ROUTING_V1, with ordered (blob) tokens.
 const LEXIS_TABLETS_ROUTING_V1_KEY: &str = "LEXIS_TABLETS_ROUTING_V1";
+/// Lexis' prefix routing: PREPARED responses carry a routing plan from which
+/// partition key prefix and range reads are routed.
+const LEXIS_PREFIX_ROUTING_V1_KEY: &str = "LEXIS_PREFIX_ROUTING_V1";
 const SCYLLA_USE_METADATA_ID_KEY: &str = "SCYLLA_USE_METADATA_ID";
 
 /// Which protocol extensions are supported by the server.
@@ -52,6 +55,9 @@ pub struct ProtocolFeatures {
     /// Whether the server supports Lexis tablets routing v1 (ordered tokens).
     pub lexis_tablets_v1_supported: bool,
 
+    /// Whether the server supports Lexis prefix routing v1.
+    pub lexis_prefix_routing_v1_supported: bool,
+
     /// Does the server supports sending metadata id (introduced in CQL v5) for CQL v4.
     pub scylla_metadata_id_supported: bool,
 }
@@ -68,6 +74,7 @@ impl ProtocolFeatures {
             ),
             tablets_v1_supported: Self::check_tablets_routing_v1_support(supported),
             lexis_tablets_v1_supported: supported.contains_key(LEXIS_TABLETS_ROUTING_V1_KEY),
+            lexis_prefix_routing_v1_supported: supported.contains_key(LEXIS_PREFIX_ROUTING_V1_KEY),
             scylla_metadata_id_supported: Self::check_scylla_metadata_id_support(supported),
         }
     }
@@ -120,6 +127,13 @@ impl ProtocolFeatures {
         if self.lexis_tablets_v1_supported {
             options.insert(
                 Cow::Borrowed(LEXIS_TABLETS_ROUTING_V1_KEY),
+                Cow::Borrowed(""),
+            );
+        }
+
+        if self.lexis_prefix_routing_v1_supported {
+            options.insert(
+                Cow::Borrowed(LEXIS_PREFIX_ROUTING_V1_KEY),
                 Cow::Borrowed(""),
             );
         }

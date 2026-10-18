@@ -12,6 +12,7 @@
 pub mod locator;
 pub(crate) mod ordered_encoding;
 pub mod partitioner;
+pub(crate) mod routing_plan;
 mod sharding;
 
 pub use sharding::{InvalidShardAwarePortRange, Shard, ShardAwarePortRange, ShardCount, Sharder};

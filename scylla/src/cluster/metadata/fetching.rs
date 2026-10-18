@@ -16,7 +16,7 @@
 
 use std::borrow::BorrowMut;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -1131,6 +1131,7 @@ impl ControlConnection {
                 clustering_key: vec![],
                 partitioner: None,
                 pk_column_specs: vec![],
+                pk_descending: vec![],
             }));
 
             let mut entry = result
@@ -1186,6 +1187,7 @@ impl ControlConnection {
                     clustering_key: vec![],
                     partitioner: None,
                     pk_column_specs: vec![],
+                    pk_descending: vec![],
                 }))
                 .map(|table| MaterializedView {
                     view_metadata: table,
@@ -1223,10 +1225,10 @@ impl ControlConnection {
         // This column shouldn't be exposed to the user but is currently exposed in system tables.
         const THRIFT_EMPTY_TYPE: &str = "empty";
 
-        type RowType = (String, String, String, String, i32, String);
+        type RowType = (String, String, String, String, i32, String, String);
 
         let rows = self.query_filter_keyspace_name::<RowType>(
-        "SELECT keyspace_name, table_name, column_name, kind, position, type FROM system_schema.columns",
+        "SELECT keyspace_name, table_name, column_name, kind, position, type, clustering_order FROM system_schema.columns",
         keyspaces_to_fetch
     ).map_err(|error| MetadataFetchError {
         error,
@@ -1238,7 +1240,8 @@ impl ControlConnection {
         let mut tables_schema: HashMap<_, Result<_, SingleKeyspaceMetadataError>> = HashMap::new();
 
         rows.map(|row_result| {
-            let (keyspace_name, table_name, column_name, kind, position, type_) = row_result?;
+            let (keyspace_name, table_name, column_name, kind, position, type_, clustering_order) =
+                row_result?;
 
             if type_ == THRIFT_EMPTY_TYPE {
                 return Ok::<_, MetadataError>(());
@@ -1309,6 +1312,7 @@ impl ControlConnection {
                     HashMap::new(), // columns
                     Vec::new(),     // partition key
                     Vec::new(),     // clustering key
+                    HashSet::new(), // DESC partition key columns (Lexis PARTITION ORDER BY)
                 )))
             else {
                 // This table was previously marked as broken, no way to insert anything.
@@ -1322,6 +1326,9 @@ impl ControlConnection {
                     entry.2.borrow_mut()
                 };
                 key_list.push((position, column_name.clone()));
+            }
+            if kind == ColumnKind::PartitionKey && clustering_order.eq_ignore_ascii_case("desc") {
+                entry.3.insert(column_name.clone());
             }
 
             entry.0.insert(
@@ -1344,10 +1351,11 @@ impl ControlConnection {
             let keyspace_and_table_name = (keyspace_name, table_name);
 
             #[expect(clippy::type_complexity)]
-            let (columns, partition_key_columns, clustering_key_columns): (
+            let (columns, partition_key_columns, clustering_key_columns, descending_pk_columns): (
                 HashMap<String, Column>,
                 Vec<(i32, String)>,
                 Vec<(i32, String)>,
+                HashSet<String>,
             ) = match table_result {
                 Ok(table) => table,
                 Err(e) => {
@@ -1421,6 +1429,11 @@ impl ControlConnection {
                 })
                 .collect();
 
+            let pk_descending = partition_key
+                .iter()
+                .map(|column_name| descending_pk_columns.contains(column_name))
+                .collect();
+
             result.insert(
                 keyspace_and_table_name,
                 Ok(Table {
@@ -1429,6 +1442,7 @@ impl ControlConnection {
                     clustering_key,
                     partitioner,
                     pk_column_specs,
+                    pk_descending,
                 }),
             );
         }

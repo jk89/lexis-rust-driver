@@ -27,6 +27,7 @@ use crate::policies::retry::RetryPolicy;
 use crate::response::query_result::ColumnSpecs;
 use crate::routing::Token;
 use crate::routing::partitioner::{Partitioner, PartitionerHasher, PartitionerName};
+use crate::routing::routing_plan::RoutingPlan;
 use crate::statement::Statement;
 
 /// Parts which are needed to construct [PreparedStatement].
@@ -51,6 +52,7 @@ pub(crate) struct RawPreparedStatement<'statement> {
     prepared_response: result::Prepared,
     is_lwt: bool,
     tracing_id: Option<Uuid>,
+    routing_plan: Option<RoutingPlan>,
 }
 
 impl<'statement> RawPreparedStatement<'statement> {
@@ -59,12 +61,14 @@ impl<'statement> RawPreparedStatement<'statement> {
         prepared_response: result::Prepared,
         is_lwt: bool,
         tracing_id: Option<Uuid>,
+        routing_plan: Option<RoutingPlan>,
     ) -> Self {
         Self {
             statement,
             prepared_response,
             is_lwt,
             tracing_id,
+            routing_plan,
         }
     }
 
@@ -91,6 +95,7 @@ impl RawPreparedStatement<'_> {
             prepared_response,
             is_lwt,
             tracing_id,
+            routing_plan,
         } = self;
         let mut prepared_statement = PreparedStatement::new(
             prepared_response.id,
@@ -105,6 +110,7 @@ impl RawPreparedStatement<'_> {
         if let Some(tracing_id) = tracing_id {
             prepared_statement.prepare_tracing_ids.push(tracing_id);
         }
+        prepared_statement.lexis_routing_plan = routing_plan.map(Arc::new);
 
         prepared_statement
     }
@@ -208,6 +214,10 @@ pub struct PreparedStatement {
     shared: Arc<PreparedStatementSharedData>,
     page_size: PageSize,
     partitioner_name: PartitionerName,
+    /// Lexis: which partition key columns are DESC (see [Self::set_pk_descending]).
+    pk_descending: Arc<[bool]>,
+    /// Lexis: the routing plan from the PREPARED response, if any.
+    lexis_routing_plan: Option<Arc<RoutingPlan>>,
 }
 
 #[derive(Debug)]
@@ -228,6 +238,8 @@ impl Clone for PreparedStatement {
             shared: self.shared.clone(),
             page_size: self.page_size,
             partitioner_name: self.partitioner_name.clone(),
+            pk_descending: self.pk_descending.clone(),
+            lexis_routing_plan: self.lexis_routing_plan.clone(),
         }
     }
 }
@@ -267,6 +279,8 @@ impl PreparedStatement {
             prepare_tracing_ids: Vec::new(),
             page_size,
             partitioner_name: Default::default(),
+            pk_descending: Arc::new([]),
+            lexis_routing_plan: None,
             config,
         }
     }
@@ -366,7 +380,7 @@ impl PreparedStatement {
         }
 
         let partition_key = self.extract_partition_key(serialized_values)?;
-        let token = partition_key.calculate_token(partitioner_name)?;
+        let token = partition_key.calculate_token(partitioner_name, &self.pk_descending)?;
 
         Ok(Some((partition_key, token)))
     }
@@ -391,8 +405,11 @@ impl PreparedStatement {
         &self,
         values: &SerializedValues,
     ) -> Result<Option<Token>, PartitionKeyError> {
-        self.extract_partition_key_and_calculate_token(&self.partitioner_name, values)
-            .map(|opt| opt.map(|(_pk, token)| token))
+        let token = self
+            .extract_partition_key_and_calculate_token(&self.partitioner_name, values)?
+            .map(|(_pk, token)| token);
+        // Lexis: prefix and range reads are routed by their routing plan.
+        Ok(self.lexis_routing_token(values).or(token))
     }
 
     /// Return keyspace name and table name this statement is operating on.
@@ -535,6 +552,21 @@ impl PreparedStatement {
         self.partitioner_name = partitioner_name;
     }
 
+    /// Sets, for each partition key column in partition key order, whether
+    /// Lexis' `PARTITION ORDER BY` declares it DESC. Prepared metadata does
+    /// not carry the direction, so it is taken from the schema metadata.
+    pub(crate) fn set_pk_descending(&mut self, pk_descending: Arc<[bool]>) {
+        self.pk_descending = pk_descending;
+    }
+
+    /// Lexis: the token this statement's partition ranges start at, computed
+    /// from the routing plan of the PREPARED response (LEXIS_PREFIX_ROUTING_V1).
+    /// Partition key prefix and range reads are routed by it; for complete
+    /// keys it is their token, with the directions the plan carries.
+    pub(crate) fn lexis_routing_token(&self, values: &SerializedValues) -> Option<Token> {
+        self.lexis_routing_plan.as_ref()?.start_token(values)
+    }
+
     /// Access metadata about the bind variables of this statement as returned by the database
     pub(crate) fn get_prepared_metadata(&self) -> &PreparedMetadata {
         &self.shared.metadata
@@ -660,6 +692,8 @@ impl PreparedStatement {
         UnconfiguredPreparedStatement {
             shared: Arc::clone(&self.shared),
             partitioner_name: self.get_partitioner_name().clone(),
+            pk_descending: self.pk_descending.clone(),
+            lexis_routing_plan: self.lexis_routing_plan.clone(),
         }
     }
 }
@@ -674,6 +708,8 @@ impl PreparedStatement {
 pub(crate) struct UnconfiguredPreparedStatement {
     shared: Arc<PreparedStatementSharedData>,
     partitioner_name: PartitionerName,
+    pk_descending: Arc<[bool]>,
+    lexis_routing_plan: Option<Arc<RoutingPlan>>,
 }
 
 impl UnconfiguredPreparedStatement {
@@ -687,6 +723,8 @@ impl UnconfiguredPreparedStatement {
             prepare_tracing_ids: Vec::new(),
             page_size,
             partitioner_name: self.partitioner_name.clone(),
+            pk_descending: self.pk_descending.clone(),
+            lexis_routing_plan: self.lexis_routing_plan.clone(),
             config,
         }
     }
@@ -833,10 +871,12 @@ impl<'ps> PartitionKey<'ps> {
     pub(crate) fn calculate_token(
         &self,
         partitioner_name: &PartitionerName,
+        pk_descending: &[bool],
     ) -> Result<Token, TokenCalculationError> {
         if *partitioner_name == PartitionerName::Ordered {
             let encoded = crate::routing::ordered_encoding::encode_partition_key(
                 self.iter().map(|(val, spec)| (spec.typ(), val)),
+                pk_descending,
             );
             return Ok(Token::from_ordered_bytes(encoded.into()));
         }

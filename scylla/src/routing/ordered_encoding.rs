@@ -4,7 +4,11 @@
 //!
 //! Each component is type-encoded, its 0x00 bytes are escaped as 0x00 0x01,
 //! and it is terminated by 0x00 0x00. Unsigned byte order of the result is
-//! partition key order for the types with an exact rule.
+//! partition key order for the types with an exact rule. A component of a
+//! column declared DESC in `PARTITION ORDER BY` is that encoding bitwise
+//! complemented, terminator included. The design (`Direction`, the 0xFF 0xFF
+//! descending terminator) is from kaebase:
+//! https://github.com/kaepek/kaebase/blob/FEAT/scaling/v2/crates/common/src/encoding/cluster_key.rs
 
 use scylla_cql::frame::response::result::{ColumnType, NativeType};
 
@@ -29,6 +33,9 @@ fn terminate(buf: &mut Vec<u8>) {
 // Float lex transform ported from kaebase v2:
 // https://github.com/kaepek/kaebase/blob/FEAT/scaling/v2/crates/common/src/encoding/float.rs
 fn float64_to_lex_u64(v: f64) -> u64 {
+    // CQL compares floats as Java does: every NaN equals every other NaN and
+    // sorts above everything, so all NaNs encode as the canonical quiet NaN.
+    let v = if v.is_nan() { f64::NAN } else { v };
     let bits = v.to_bits();
     if bits >> 63 == 0 {
         bits | (1u64 << 63)
@@ -136,6 +143,43 @@ fn encode_decimal(buf: &mut Vec<u8>, raw: &[u8]) -> Option<()> {
     Some(())
 }
 
+// time_hi (version masked), time_mid, time_low.
+fn time_fields(raw: &[u8]) -> [u8; 8] {
+    [
+        raw[6] & 0x0f,
+        raw[7],
+        raw[4],
+        raw[5],
+        raw[0],
+        raw[1],
+        raw[2],
+        raw[3],
+    ]
+}
+
+// CQL order: the time fields, the clock sequence and node as signed bytes,
+// then the version nibble.
+fn encode_timeuuid(buf: &mut Vec<u8>, raw: &[u8]) {
+    escape_all(buf, &time_fields(raw));
+    for &b in &raw[8..] {
+        escape_byte(buf, b ^ 0x80);
+    }
+    escape_byte(buf, raw[6] >> 4);
+}
+
+// CQL order: the version, then for version 1 the time fields and the rest
+// unsigned, for other versions all bytes in order.
+fn encode_uuid(buf: &mut Vec<u8>, raw: &[u8]) {
+    let version = raw[6] >> 4;
+    escape_byte(buf, version);
+    if version == 1 {
+        escape_all(buf, &time_fields(raw));
+        escape_all(buf, &raw[8..]);
+    } else {
+        escape_all(buf, raw);
+    }
+}
+
 fn encode_component(buf: &mut Vec<u8>, typ: &ColumnType<'_>, raw: &[u8]) {
     if raw.is_empty() {
         terminate(buf);
@@ -174,12 +218,14 @@ fn encode_component(buf: &mut Vec<u8>, typ: &ColumnType<'_>, raw: &[u8]) {
                 escape_all(buf, &float64_to_lex_u64(v).to_be_bytes());
             }
             NativeType::Varint => encode_varint(buf, raw),
+            NativeType::Timeuuid if raw.len() == 16 => encode_timeuuid(buf, raw),
+            NativeType::Uuid if raw.len() == 16 => encode_uuid(buf, raw),
             NativeType::Decimal => {
                 if encode_decimal(buf, raw).is_none() {
                     escape_all(buf, raw);
                 }
             }
-            // Text, ascii, blob, uuid, timeuuid, inet, duration, and any
+            // Text, ascii, blob, inet, duration, and any
             // malformed fixed-size value: raw bytes, like the server.
             _ => escape_all(buf, raw),
         },
@@ -190,15 +236,35 @@ fn encode_component(buf: &mut Vec<u8>, typ: &ColumnType<'_>, raw: &[u8]) {
 }
 
 /// Encodes partition key components (in partition key order) into the bytes
-/// of an OrderedPartitioner token.
+/// of an OrderedPartitioner token. `descending[i]` is whether component `i`
+/// is DESC; missing entries are ASC.
 pub(crate) fn encode_partition_key<'a, 'b: 'a>(
     components: impl Iterator<Item = (&'a ColumnType<'b>, &'a [u8])>,
+    descending: &[bool],
 ) -> Vec<u8> {
     let mut buf = Vec::new();
-    for (typ, raw) in components {
+    for (i, (typ, raw)) in components.enumerate() {
+        let mark = buf.len();
         encode_component(&mut buf, typ, raw);
+        if descending.get(i).copied().unwrap_or(false) {
+            for b in &mut buf[mark..] {
+                *b = !*b;
+            }
+        }
     }
     buf
+}
+
+/// The smallest byte string greater than every string that starts with `p`
+/// (trailing 0xff bytes dropped, then the last byte incremented), or None if
+/// `p` is all 0xff. The server's `dht::ordered_encoding::prefix_successor()`.
+pub(crate) fn prefix_successor(mut p: Vec<u8>) -> Option<Vec<u8>> {
+    while p.last() == Some(&0xff) {
+        p.pop();
+    }
+    let last = p.last_mut()?;
+    *last += 1;
+    Some(p)
 }
 
 #[cfg(test)]
@@ -229,6 +295,8 @@ mod tests {
             "varint" => NativeType::Varint,
             "decimal" => NativeType::Decimal,
             "uuid" => NativeType::Uuid,
+            "timeuuid" => NativeType::Timeuuid,
+            "inet" => NativeType::Inet,
             other => panic!("unknown type {other}"),
         }
     }
@@ -246,21 +314,40 @@ mod tests {
                 parts.next().unwrap(),
                 parts.next().unwrap(),
             );
-            let types: Vec<_> = types
+            // DESC columns are written desc(<type>).
+            let (types, descending): (Vec<_>, Vec<_>) = types
                 .split(',')
-                .map(|t| ColumnType::Native(native(t)))
-                .collect();
+                .map(
+                    |t| match t.strip_prefix("desc(").and_then(|t| t.strip_suffix(')')) {
+                        Some(t) => (ColumnType::Native(native(t)), true),
+                        None => (ColumnType::Native(native(t)), false),
+                    },
+                )
+                .unzip();
             let values: Vec<_> = values.split(',').map(unhex).collect();
-            let got = encode_partition_key(types.iter().zip(values.iter().map(|v| v.as_slice())));
+            let got = encode_partition_key(
+                types.iter().zip(values.iter().map(|v| v.as_slice())),
+                &descending,
+            );
             assert_eq!(got, unhex(token), "vector: {line}");
             n += 1;
         }
-        assert_eq!(n, 640);
+        assert_eq!(n, 1030);
     }
 
     fn enc(typ: NativeType, raw: &[u8]) -> Vec<u8> {
         let t = ColumnType::Native(typ);
-        encode_partition_key(std::iter::once((&t, raw)))
+        encode_partition_key(std::iter::once((&t, raw)), &[])
+    }
+
+    #[test]
+    fn desc_is_complement() {
+        let t = ColumnType::Native(NativeType::Text);
+        let desc = |raw: &[u8]| encode_partition_key(std::iter::once((&t, raw)), &[true]);
+        let asc = enc(NativeType::Text, b"xyz");
+        assert_eq!(desc(b"xyz"), asc.iter().map(|b| !b).collect::<Vec<_>>());
+        // "xyz" > "xy", so DESC puts "xyz" first.
+        assert!(desc(b"xyz") < desc(b"xy"));
     }
 
     #[test]
@@ -269,7 +356,7 @@ mod tests {
         let t = ColumnType::Native(NativeType::Int);
         let a = 143i32.to_be_bytes();
         let b = 234i32.to_be_bytes();
-        let got = encode_partition_key([(&t, &a[..]), (&t, &b[..])].into_iter());
+        let got = encode_partition_key([(&t, &a[..]), (&t, &b[..])].into_iter(), &[]);
         assert_eq!(
             got,
             vec![

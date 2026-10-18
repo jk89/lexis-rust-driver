@@ -23,6 +23,7 @@ use crate::policies::timestamp_generator::TimestampGenerator;
 use crate::response::query_result::QueryResult;
 use crate::response::{NonErrorAuthResponse, NonErrorStartupResponse, PagingState, QueryResponse};
 use crate::routing::locator::tablets::{RawTablet, TabletParsingError};
+use crate::routing::routing_plan::{self, RoutingPlan};
 use crate::routing::{Shard, ShardAwarePortRange, ShardInfo, Sharder, ShardingError};
 use crate::statement::batch::{Batch, BatchStatement};
 use crate::statement::prepared::{PreparedStatement, RawPreparedStatement};
@@ -716,11 +717,17 @@ impl Connection {
                     .features
                     .protocol_features
                     .prepared_flags_contain_lwt_mark(p.prepared_metadata.flags as u32);
+                let routing_plan = query_response
+                    .custom_payload
+                    .as_ref()
+                    .and_then(|payload| payload.get(routing_plan::CUSTOM_PAYLOAD_KEY))
+                    .and_then(RoutingPlan::from_payload);
                 Ok(RawPreparedStatement::new(
                     statement,
                     p,
                     is_lwt,
                     query_response.tracing_id,
+                    routing_plan,
                 ))
             }
             _ => Err(RequestAttemptError::UnexpectedResponse(

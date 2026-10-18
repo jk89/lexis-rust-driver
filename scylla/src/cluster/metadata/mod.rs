@@ -172,6 +172,9 @@ pub struct Table {
     pub partitioner: Option<String>,
     /// Column specs for the partition key columns.
     pub(crate) pk_column_specs: Vec<ColumnSpec<'static>>,
+    /// For each partition key column, whether Lexis' `PARTITION ORDER BY`
+    /// declares it DESC. Lexis tokens encode DESC columns complemented.
+    pub(crate) pk_descending: Vec<bool>,
 }
 
 /// Describes a materialized view in the cluster.

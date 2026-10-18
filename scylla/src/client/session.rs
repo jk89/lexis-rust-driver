@@ -1614,8 +1614,26 @@ impl Session {
                 .and_then(PartitionerName::from_str)
                 .unwrap_or_default(),
         );
+        if let Some(pk_descending) = Self::extract_pk_descending(&prepared, cluster_state) {
+            prepared.set_pk_descending(pk_descending.into());
+        }
 
         Ok(prepared)
+    }
+
+    fn extract_pk_descending<'a>(
+        prepared: &PreparedStatement,
+        cluster_state: &'a ClusterState,
+    ) -> Option<&'a [bool]> {
+        let table_spec = prepared.get_table_spec()?;
+        let keyspace = cluster_state.keyspaces.get(table_spec.ks_name())?;
+        let table = keyspace.tables.get(table_spec.table_name()).or_else(|| {
+            keyspace
+                .views
+                .get(table_spec.table_name())
+                .map(|view| &view.view_metadata)
+        })?;
+        Some(table.pk_descending.as_slice())
     }
 
     fn extract_partitioner_name<'a>(
@@ -1658,6 +1676,8 @@ impl Session {
             )
             .map_err(PartitionKeyError::into_execution_error)?
             .unzip();
+        // Lexis: the routing plan routes prefix and range reads too.
+        let token = prepared.lexis_routing_token(serialized_values).or(token);
 
         let execution_profile = prepared
             .get_execution_profile_handle()
